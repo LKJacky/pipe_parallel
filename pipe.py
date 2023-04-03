@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 
 import torch
 import torch.distributed.rpc as rpc
@@ -69,7 +70,7 @@ class DistributedLLama(nn.Module):
         return x_rref.to_here()
 
 
-def master(gpus=4, gpu_per_node=4):
+def master(gpus=4, gpu_per_node=4, arg=None):
 
     with torch.no_grad():
         layers = DistributedLLama(llama_65B_config,
@@ -79,15 +80,19 @@ def master(gpus=4, gpu_per_node=4):
         llama_65B_config.num_hidden_layers = 0
         llama = LLamaWrapper(llama_65B_config).cuda().half()
 
-        x = torch.rand([1, 2048]).cuda().long()
+        x = torch.rand([arg.b, arg.s]).cuda().long()
 
-        x = llama.embed_tokens(x).half()
-        y = layers(x).cuda()
-        y = llama.norm(y)
+        from torch.cuda.amp import autocast
+        t0 = time.time()
+        with autocast():
+            x = llama.embed_tokens(x)
+            y = layers(x).cuda()
+            y = llama.norm(y)
+        print(f'total use {time.time()-t0:.2f}s with {x.shape}')
         print(y)
 
 
-def run_workers(rank, machine, world_size, n_per_node=1):
+def run_workers(rank, machine, world_size, n_per_node=1, arg=None):
 
     os.environ['MASTER_ADDR'] = '10.140.54.75'
     os.environ['MASTER_PORT'] = '29513'
@@ -113,7 +118,7 @@ def run_workers(rank, machine, world_size, n_per_node=1):
                      rank=rank,
                      world_size=world_size + 1,
                      rpc_backend_options=options)
-        master(world_size, n_per_node)
+        master(world_size, n_per_node, arg)
     else:
         rpc.init_rpc(f'worker_{parallel_rank}',
                      rank=rank,
@@ -133,10 +138,12 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('machine', type=int)
+    parser.add_argument('-s', type=int, help='len of sequence', default=2048)
+    parser.add_argument('-b', type=int, help='batch of sequence', default=1)
     arg = parser.parse_args()
     machine = arg.machine
 
     mp.spawn(run_workers,
-             args=(machine, world_size, n_per_node),
+             args=(machine, world_size, n_per_node, arg),
              nprocs=n_per_node if machine != 0 else n_per_node + 1,
              join=True)
