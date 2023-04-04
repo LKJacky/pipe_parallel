@@ -45,10 +45,17 @@ class DistributedLLamaLayersNode(DistributedModule):
             *[LLaMaDecoderLayerWrapper(config)
               for _ in range(num_layers)]).to(self.device).half()
 
-    def reset_past_kv(self):
+    def forward(self, x_rref: RRef, session: int = 0):
+        x = x_rref.to_here().to(self.device)
+        with self._lock:
+            for layer in self.module:
+                x = layer(x, session=session)
+        return x.cpu()
+
+    def reset_past_kv(self, sessions=None):
         for module in self.module:
             module: LLaMaDecoderLayerWrapper
-            module.reset_past_kv()
+            module.reset_past_kv(session=sessions)
 
 
 class DistributedLLamaLayers(nn.Module):
@@ -64,16 +71,16 @@ class DistributedLLamaLayers(nn.Module):
                            DistributedLLamaLayersNode,
                            args=(config, num, torch.device(f'cuda:{cuda_i}'))))
 
-    def forward(self, x):
+    def forward(self, x, session=0):
         x_rref = RRef(x.cpu())
 
         for p_rref in self.p_rref_s:
-            x_rref = p_rref.remote().forward(x_rref)
+            x_rref = p_rref.remote().forward(x_rref, session)
         return x_rref.to_here()
 
-    def reset_kv(self):
+    def reset_kv(self, sessions=None):
         for p_rref in self.p_rref_s:
-            p_rref.remote().reset_past_kv()
+            p_rref.remote().reset_past_kv(sessions)
 
 
 class DistributedLLaMa(nn.Module):
@@ -99,12 +106,12 @@ class DistributedLLaMa(nn.Module):
     def forward(self, x, session: int = 0):
 
         y = self.embed_tokens(x)
-        y = self.layers(y).to(x.device)
+        y = self.layers(y, session).to(x.device)
         y = self.norm(y)
         return y
 
-    def reset_kv(self):
-        self.layers.reset_kv()
+    def reset_kv(self, sessions=None):
+        self.layers.reset_kv(sessions=sessions)
 
 
 def master(gpus=4, gpu_per_node=4, arg=None):
@@ -190,7 +197,7 @@ if __name__ == '__main__':
 
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('machine', type=int)
+    parser.add_argument('machine', type=int, default=0)
     parser.add_argument('-s', type=int, help='len of sequence', default=2048)
     parser.add_argument('-b', type=int, help='batch of sequence', default=1)
     arg = parser.parse_args()

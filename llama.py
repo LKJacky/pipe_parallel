@@ -19,8 +19,8 @@ llama_65B_config = LLaMAConfig(hidden_size=8192,
 class LLaMaDecoderLayerWrapper(LLaMADecoderLayer):
     def __init__(self, config: LLaMAConfig):
         super().__init__(config)
-        self.pass_k = None
-        self.pass_v = None
+
+        self.pass_kv = {}  # sesion name: key and value
 
         # attn_mask = torch.eye(config.max_length)
         # self.register_buffer('attn_mask', attn_mask).bool()  # N N
@@ -30,29 +30,32 @@ class LLaMaDecoderLayerWrapper(LLaMADecoderLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None
+        session=0,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor,
                                                  torch.FloatTensor]]]:
         # TODO add attention mask
         use_cache = True
-        if self.pass_k is not None:
-            past_kv = (self.pass_k, self.pass_v)
+        attention_mask = None
+        output_attentions = None
+
+        if session in self.pass_kv:
+            past_kv = self.pass_kv[session]
         else:
             past_kv = None
         attn_out, (past_k, past_v) = super().forward(hidden_states,
                                                      attention_mask,
                                                      output_attentions,
                                                      use_cache, past_kv)
-        self.pass_k = past_k.detach()
-        self.pass_v = past_v.detach()
+
+        self.pass_kv[session] = (past_k.detach(), past_v.detach())
+
         return attn_out
 
-    def reset_past_kv(self):
-        self.pass_k = None
-        self.pass_v = None
+    def reset_past_kv(self, session=None):
+        if session is None:
+            self.pass_kv = {}
+        else:
+            self.pass_kv.pop(session)
 
 
 class LLamaWrapper(LLaMAModel):
