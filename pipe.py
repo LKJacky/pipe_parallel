@@ -19,6 +19,7 @@ if DEBUG:
     llama_65B_config.intermediate_size = 128
     GPUS = 4
     GPU_PER_NODE = 4
+    print('DEBUG MODE')
 else:
     GPUS = 8
     GPU_PER_NODE = 4
@@ -147,7 +148,7 @@ class DistributedLLaMa(nn.Module):
                 for layer in self.layers:
                     out[i] = layer.remote().forward(out[i], i)
             if (n + 1) % 50 == 0:
-                # when iteration suplus 50 times, it may hung up.
+                # when iterations exceed 50, it may hung up.
                 out = [re_ref(o) for o in out]
                 print(f'generate:\t{n + 1}/{num}')
         out = [o.to_here().to(x.device) for o in out]
@@ -176,7 +177,7 @@ def master(gpus=4, gpu_per_node=4, arg=None):
         # test encoding
         x = torch.rand([arg.b, arg.s]).cuda().long()
         t0 = time.time()
-        for i in range(10):
+        for i in range(1):
             torch.cuda.synchronize()
             with autocast():
                 _ = llama(x)
@@ -195,9 +196,10 @@ def master(gpus=4, gpu_per_node=4, arg=None):
             else:
                 llama.reset_kv()
                 llama.generate_pipe(x, num=arg.s)
-        print(
-            f'total use average {(time.time()-t0)/(arg.s):.2f}s to generate {arg.s} tokens'  # noqa
-        )
+        torch.cuda.synchronize()
+        t = time.time() - t0
+        print(f'average {arg.s/t:.2f} token per second per batch.'  # noqa
+              )
 
 
 def run_workers(rank, machine, world_size, n_per_node=1, arg=None):
