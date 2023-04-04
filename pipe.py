@@ -81,7 +81,7 @@ class DistributedLLamaTail(DistributedModule):
         with self._lock:
             x = self.norm(x)
             x = x[:, -1, :]
-            x = x.argmax(dim=-1)
+            x = x.argmax(dim=-1, keepdim=True)
         return x.cpu()
 
 
@@ -124,6 +124,18 @@ class DistributedLLaMa(nn.Module):
         x_rref = self.norm.remote().forward(x_rref)
         return x_rref.to_here().to(x.device)
 
+    def generate(self, x: torch.Tensor, num=1, session=0):
+        x_rref = RRef(x.cpu())
+
+        for i in range(num):
+            x_rref = self.embed_tokens.remote().forward(x_rref)
+            for layer in self.layers:
+                x_rref = layer.remote().forward(x_rref, session)
+            x_rref = self.norm.remote().forward(x_rref)
+            if i % 100 == 0:
+                print('generate', i, num)
+        return x_rref.to_here().to(x.device)
+
     def reset_kv(self, session=None):
         for layer in self.layers:
             layer: DistributedLLamaLayer
@@ -158,14 +170,11 @@ def master(gpus=4, gpu_per_node=4, arg=None):
         x = torch.rand([arg.b, 1]).cuda().long()
         t0 = time.time()
         torch.cuda.synchronize()
-        for i in range(arg.s):
-            with autocast():
-                _ = llama(x)
-            if i % 100 == 0:
-                torch.cuda.synchronize()
-                print(
-                    f'total use average {(time.time()-t0)/(i+1):.2f}s with {i+1} tokens'  # noqa
-                )
+        with autocast():
+            llama.generate(x, num=arg.s)
+        print(
+            f'total use average {(time.time()-t0)/(arg.s):.2f}s to generate {arg.s} tokens'  # noqa
+        )
 
 
 def run_workers(rank, machine, world_size, n_per_node=1, arg=None):
