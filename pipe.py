@@ -13,6 +13,7 @@ from llama import (LLaMAConfig, LLaMaDecoderLayerWrapper, LLamaWrapper,
                    llama_65B_config)
 
 DEBUG = os.environ.get('DEBUG', 'False') == 'true'
+RE_ITER = 50
 
 if DEBUG:
     llama_65B_config.hidden_size = 128
@@ -129,7 +130,7 @@ class DistributedLLaMa(nn.Module):
         for n in range(num):
             for layer in self.layers:
                 x_rref = layer.remote().forward(x_rref, session)
-            if (n + 1) % 50 == 0:
+            if (n + 1) % RE_ITER == 0:
                 x_rref = re_ref(x_rref)
                 print(f'generate:\t{n + 1}/{num}')
 
@@ -141,13 +142,13 @@ class DistributedLLaMa(nn.Module):
         assert B > 1 and B % len(self.layers) == 0
 
         out = []
-        for i, x_i in enumerate(torch.split(x, len(self.layers), dim=0)):
+        for i, x_i in enumerate(torch.split(x, B // len(self.layers), dim=0)):
             out.append(RRef(x_i.cpu()))
         for n in range(num):
             for i in range(len(out)):
                 for layer in self.layers:
                     out[i] = layer.remote().forward(out[i], i)
-            if (n + 1) % 50 == 0:
+            if (n + 1) % RE_ITER == 0:
                 # when iterations exceed 50, it may hung up.
                 out = [re_ref(o) for o in out]
                 print(f'generate:\t{n + 1}/{num}')
@@ -190,7 +191,7 @@ def master(gpus=4, gpu_per_node=4, arg=None):
         t0 = time.time()
         torch.cuda.synchronize()
         with autocast():
-            if arg.b == 1:
+            if arg.p == 0:
                 llama.reset_kv()
                 llama.generate(x, num=arg.s)
             else:
@@ -250,6 +251,7 @@ if __name__ == '__main__':
     parser.add_argument('machine', type=int, default=0)
     parser.add_argument('-s', type=int, help='len of sequence', default=2048)
     parser.add_argument('-b', type=int, help='batch of sequence', default=1)
+    parser.add_argument('-p', type=int, help='batch of sequence', default=0)
     arg = parser.parse_args()
     machine = arg.machine
 
