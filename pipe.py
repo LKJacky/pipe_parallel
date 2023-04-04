@@ -14,8 +14,8 @@ from llama import (LLaMAConfig, LLaMaDecoderLayerWrapper, LLamaWrapper,
 
 DEBUG = True
 
-# llama_65B_config.hidden_size = 512
-# llama_65B_config.intermediate_size = 512
+# llama_65B_config.hidden_size = 128
+# llama_65B_config.intermediate_size = 128
 
 
 class DistributedModule(nn.Module):
@@ -26,8 +26,6 @@ class DistributedModule(nn.Module):
         self.module: nn.Module
 
     def forward(self, x_rref: RRef):
-        if DEBUG:
-            print(f'run on {self.device}')
         x = x_rref.to_here().to(self.device)
         with self._lock:
             out = self.module(x)
@@ -40,6 +38,11 @@ class DistributedLLamaLayers(DistributedModule):
         self.module = nn.Sequential(
             *[LLaMaDecoderLayerWrapper(config)
               for _ in range(num_layers)]).to(self.device).half()
+
+    def reset_past_kv(self):
+        for module in self.module:
+            module: LLaMaDecoderLayerWrapper
+            module.reset_past_kv()
 
 
 class DistributedLLama(nn.Module):
@@ -70,6 +73,10 @@ class DistributedLLama(nn.Module):
             x_rref = p_rref.remote().forward(x_rref)
         return x_rref.to_here()
 
+    def reset_kv(self):
+        for p_rref in self.p_rref_s:
+            p_rref.remote().reset_past_kv()
+
 
 def master(gpus=4, gpu_per_node=4, arg=None):
 
@@ -81,15 +88,16 @@ def master(gpus=4, gpu_per_node=4, arg=None):
         llama_65B_config.num_hidden_layers = 0
         llama = LLamaWrapper(llama_65B_config).cuda().half()
 
-        x = torch.rand([arg.b, arg.s]).cuda().long()
-
         # wram up
+        x = torch.rand([arg.b, arg.s]).cuda().long()
         with autocast():
             x = llama.embed_tokens(x)
             y = layers(x).cuda()
             y = llama.norm(y)
-        x = torch.rand([arg.b, arg.s]).cuda().long()
+            layers.reset_kv()
 
+        # test encoding
+        x = torch.rand([arg.b, arg.s]).cuda().long()
         t0 = time.time()
         for i in range(10):
             torch.cuda.synchronize()
@@ -97,9 +105,25 @@ def master(gpus=4, gpu_per_node=4, arg=None):
                 y = llama.embed_tokens(x)
                 y = layers(y).cuda()
                 y = llama.norm(y)
+                layers.reset_kv()
             torch.cuda.synchronize()
         print(f'total use {(time.time()-t0)/10:.2f}s with {x.shape}')
-        print(y)
+
+        # test per token
+        x = torch.rand([1, 1]).cuda().long()
+        t0 = time.time()
+        torch.cuda.synchronize()
+        for i in range(arg.s):
+            with autocast():
+                y: torch.Tensor = llama.embed_tokens(x)
+                y = layers(y).cuda()
+                y = llama.norm(y)
+            if i % 100 == 0:
+                print(
+                    f'total use average {(time.time()-t0)/(i+1):.2f}s with {i+1} tokens'  # noqa
+                )
+        torch.cuda.synchronize()
+        layers.reset_kv()
 
 
 def run_workers(rank, machine, world_size, n_per_node=1, arg=None):
