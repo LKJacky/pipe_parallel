@@ -6,6 +6,7 @@ import torch
 import torch.distributed.rpc as rpc
 import torch.multiprocessing as mp
 import torch.nn as nn
+from torch.cuda.amp import autocast
 from torch.distributed.rpc import RRef
 
 from llama import (LLaMAConfig, LLaMaDecoderLayerWrapper, LLamaWrapper,
@@ -82,13 +83,22 @@ def master(gpus=4, gpu_per_node=4, arg=None):
 
         x = torch.rand([arg.b, arg.s]).cuda().long()
 
-        from torch.cuda.amp import autocast
-        t0 = time.time()
+        # wram up
         with autocast():
             x = llama.embed_tokens(x)
             y = layers(x).cuda()
             y = llama.norm(y)
-        print(f'total use {time.time()-t0:.2f}s with {x.shape}')
+        x = torch.rand([arg.b, arg.s]).cuda().long()
+
+        t0 = time.time()
+        for i in range(10):
+            torch.cuda.synchronize()
+            with autocast():
+                y = llama.embed_tokens(x)
+                y = layers(y).cuda()
+                y = llama.norm(y)
+            torch.cuda.synchronize()
+        print(f'total use {(time.time()-t0)/10:.2f}s with {x.shape}')
         print(y)
 
 
