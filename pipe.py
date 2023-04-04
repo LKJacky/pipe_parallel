@@ -38,12 +38,15 @@ class DistributedModule(nn.Module):
         return out.cpu()
 
 
-class DistributedLLamaLayersNode(DistributedModule):
+# distributed llama modules run on a gpu
+
+
+class DistributedLLamaLayer(DistributedModule):
     def __init__(self, config, num_layers, device, *args, **kwargs) -> None:
         super().__init__(device, *args, **kwargs)
         self.module = nn.Sequential(
             *[LLaMaDecoderLayerWrapper(config)
-              for _ in range(num_layers)]).to(self.device).half()
+              for _ in range(num_layers)]).to(self.device)
 
     def forward(self, x_rref: RRef, session: int = 0):
         x = x_rref.to_here().to(self.device)
@@ -52,35 +55,37 @@ class DistributedLLamaLayersNode(DistributedModule):
                 x = layer(x, session=session)
         return x.cpu()
 
-    def reset_past_kv(self, sessions=None):
+    def reset_past_kv(self, session=None):
         for module in self.module:
             module: LLaMaDecoderLayerWrapper
-            module.reset_past_kv(session=sessions)
+            module.reset_past_kv(session=session)
 
 
-class DistributedLLamaLayers(nn.Module):
-    def __init__(self, config: LLaMAConfig, layers=[8, 8, 8], cudas=[1, 2, 3]):
-        print('layers', layers, 'cudas', cudas)
-        super().__init__()
+class DistributedLLamaHead(DistributedModule):
+    def __init__(self, config: LLaMAConfig, device, *args, **kwargs) -> None:
+        super().__init__(device, *args, **kwargs)
+        config.num_hidden_layers = 0
+        llama = LLamaWrapper(config)
+        self.module = llama.embed_tokens.to(self.device)
 
-        self.p_rref_s = []
 
-        for i, (num, cuda_i) in enumerate(zip(layers, cudas), start=0):
-            self.p_rref_s.append(
-                rpc.remote(f'worker_{i}',
-                           DistributedLLamaLayersNode,
-                           args=(config, num, torch.device(f'cuda:{cuda_i}'))))
+class DistributedLLamaTail(DistributedModule):
+    def __init__(self, config: LLaMAConfig, device, *args, **kwargs) -> None:
+        super().__init__(device, *args, **kwargs)
+        config.num_hidden_layers = 0
+        llama = LLamaWrapper(config)
+        self.norm = llama.norm.to(self.device)
 
-    def forward(self, x, session=0):
-        x_rref = RRef(x.cpu())
+    def forward(self, x_rref: RRef):
+        x: torch.Tensor = x_rref.to_here().to(self.device)
+        with self._lock:
+            x = self.norm(x)
+            x = x[:, -1, :]
+            x = x.argmax(dim=-1)
+        return x.cpu()
 
-        for p_rref in self.p_rref_s:
-            x_rref = p_rref.remote().forward(x_rref, session)
-        return x_rref.to_here()
 
-    def reset_kv(self, sessions=None):
-        for p_rref in self.p_rref_s:
-            p_rref.remote().reset_past_kv(sessions)
+# distributed llama model
 
 
 class DistributedLLaMa(nn.Module):
@@ -92,26 +97,37 @@ class DistributedLLaMa(nn.Module):
                  **kwargs) -> None:
         super().__init__(*args, **kwargs)
 
-        config.num_hidden_layers = 0
+        self.embed_tokens = rpc.remote('worker_0',
+                                       DistributedLLamaHead,
+                                       args=(config, 'cuda:0'))
+        self.norm = rpc.remote('worker_0',
+                               DistributedLLamaTail,
+                               args=(config, 'cuda:0'))
 
-        llama = LLamaWrapper(config)
-        self.embed_tokens = llama.embed_tokens
-        self.norm = llama.norm
+        layer_nums = [10] * gpus
+        cuda_num = list(range(gpu_per_node)) * (gpus // gpu_per_node)
 
-        self.layers = DistributedLLamaLayers(config,
-                                             layers=[10] * gpus,
-                                             cudas=list(range(gpu_per_node)) *
-                                             (gpus // gpu_per_node))
+        self.layers = []
+
+        for i, (num, cuda_i) in enumerate(zip(layer_nums, cuda_num), start=0):
+            self.layers.append(
+                rpc.remote(f'worker_{i}',
+                           DistributedLLamaLayer,
+                           args=(config, num, torch.device(f'cuda:{cuda_i}'))))
 
     def forward(self, x, session: int = 0):
+        x_rref = RRef(x.cpu())
 
-        y = self.embed_tokens(x)
-        y = self.layers(y, session).to(x.device)
-        y = self.norm(y)
-        return y
+        x_rref = self.embed_tokens.remote().forward(x_rref)
+        for layer in self.layers:
+            x_rref = layer.remote().forward(x_rref, session)
+        x_rref = self.norm.remote().forward(x_rref)
+        return x_rref.to_here().to(x.device)
 
-    def reset_kv(self, sessions=None):
-        self.layers.reset_kv(sessions=sessions)
+    def reset_kv(self, session=None):
+        for layer in self.layers:
+            layer: DistributedLLamaLayer
+            layer.remote().reset_past_kv(session=session)
 
 
 def master(gpus=4, gpu_per_node=4, arg=None):
